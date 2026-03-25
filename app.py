@@ -308,14 +308,26 @@ scanning_active = False
 pending_tag     = None
 pending_lock    = threading.Lock()
 
+def is_roku_playing(roku_ip):
+    """Check if Roku is currently playing media via ECP."""
+    try:
+        r = requests.get(f"http://{roku_ip}:8060/query/media-player", timeout=3)
+        if r.ok:
+            # Returns XML — check for 'play' state
+            return '<state>play</state>' in r.text or '<state>buffer</state>' in r.text
+    except:
+        pass
+    return False
+
 def nfc_scan_loop():
     global pending_tag
     log.info("NFC scan loop started")
     from smartcard.System import readers
     from smartcard.Exceptions import CardConnectionException
-    GET_UID  = [0xFF, 0xCA, 0x00, 0x00, 0x00]
-    last_uid  = None
-    last_time = 0
+
+    GET_UID       = [0xFF, 0xCA, 0x00, 0x00, 0x00]
+    last_uid      = None   # UID of last inserted cartridge
+    tag_present   = False  # is a tag currently on the reader?
 
     while scanning_active:
         try:
@@ -323,69 +335,85 @@ def nfc_scan_loop():
             if not r:
                 time.sleep(2)
                 continue
+
             conn = r[0].createConnection()
             conn.connect()
             data, sw1, sw2 = conn.transmit(GET_UID)
             conn.disconnect()
             uid = '-'.join(f'{b:02X}' for b in data)
-            now = time.time()
 
-            if uid and (uid != last_uid or now - last_time > 5):
-                last_uid  = uid
-                last_time = now
-                log.info(f"Tag scanned: {uid}")
+            if uid == last_uid and tag_present:
+                # Same cartridge still sitting in — do nothing
+                time.sleep(0.5)
+                continue
 
-                entry = {
-                    "tag_id":    uid,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "label":     tags.get(uid, {}).get("label", "Unknown"),
-                    "played":    uid in tags
-                }
-                scan_log.append(entry)
-                save_log()
+            if uid == last_uid and not tag_present:
+                # Same cartridge re-inserted — do nothing, media already playing
+                log.info(f"Same cartridge re-inserted: {uid} — no change")
+                tag_present = True
+                time.sleep(0.5)
+                continue
 
-                socketio.emit('tag_scanned', {
-                    "tag_id":   uid,
-                    "known":    uid in tags,
-                    "tag_data": tags.get(uid, {})
-                })
+            # ── Different cartridge inserted ──────────────────────────────
+            last_uid    = uid
+            tag_present = True
+            log.info(f"New cartridge inserted: {uid}")
 
-                if uid in tags:
-                    tag    = tags[uid]
-                    source = tag.get("source", "jellyfin")
-                    roku_ip    = tag.get("roku_ip", config.get("default_roku_ip", "192.168.1.15"))
-                    channel_id = tag.get("channel_id", "592369")
+            entry = {
+                "tag_id":    uid,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "label":     tags.get(uid, {}).get("label", "Unknown"),
+                "played":    uid in tags
+            }
+            scan_log.append(entry)
+            save_log()
 
-                    if source == "external":
-                        content_id = tag.get("ext_content_id", "")
-                        media_type = tag.get("ext_media_type", "movie")
-                        try:
-                            params = {'contentId': content_id, 'mediaType': media_type} if content_id else {}
-                            r = requests.post(f"http://{roku_ip}:8060/launch/{channel_id}", params=params, timeout=5)
-                            ok = r.ok
-                        except Exception as e:
-                            log.error(f"External launch error: {e}")
-                            ok = False
-                    else:
-                        ok = roku_launch_content(
-                            roku_ip     = roku_ip,
-                            channel_id  = channel_id,
-                            jellyfin_id = tag.get("jellyfin_id"),
-                            media_type  = tag.get("media_type", "movie"),
-                            resume      = tag.get("resume", True),
-                            audio_lang  = tag.get("audio_lang", "")
-                        )
-                    log.info(f"Launched '{tag.get('label')}' [{source}] — ok={ok}")
+            socketio.emit('tag_scanned', {
+                "tag_id":   uid,
+                "known":    uid in tags,
+                "tag_data": tags.get(uid, {})
+            })
+
+            if uid in tags:
+                tag        = tags[uid]
+                source     = tag.get("source", "jellyfin")
+                roku_ip    = tag.get("roku_ip", config.get("default_roku_ip", "192.168.1.15"))
+                channel_id = tag.get("channel_id", "592369")
+
+                if source == "external":
+                    content_id = tag.get("ext_content_id", "")
+                    media_type = tag.get("ext_media_type", "movie")
+                    try:
+                        params = {'contentId': content_id, 'mediaType': media_type} if content_id else {}
+                        r = requests.post(f"http://{roku_ip}:8060/launch/{channel_id}", params=params, timeout=5)
+                        ok = r.ok
+                    except Exception as e:
+                        log.error(f"External launch error: {e}")
+                        ok = False
                 else:
-                    with pending_lock:
-                        pending_tag = uid
+                    ok = roku_launch_content(
+                        roku_ip     = roku_ip,
+                        channel_id  = channel_id,
+                        jellyfin_id = tag.get("jellyfin_id"),
+                        media_type  = tag.get("media_type", "movie"),
+                        resume      = tag.get("resume", True),
+                        audio_lang  = tag.get("audio_lang", "")
+                    )
+                log.info(f"Launched '{tag.get('label')}' [{source}] — ok={ok}")
+            else:
+                with pending_lock:
+                    pending_tag = uid
 
         except CardConnectionException:
-            last_uid = None
+            # Tag removed — just note it, keep playing
+            if tag_present:
+                log.info(f"Cartridge removed: {last_uid} — keeping media playing")
+            tag_present = False
+            # last_uid intentionally kept so re-insert of same cartridge is detected
         except Exception as e:
             if 'No smart card' not in str(e) and 'No card' not in str(e):
                 log.error(f"NFC loop error: {e}")
-            last_uid = None
+            tag_present = False
 
         time.sleep(0.5)
 
