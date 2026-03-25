@@ -1,0 +1,15 @@
+[Unit]
+Description=NFC Jukebox Web Interface
+After=network.target pcscd.service
+Requires=pcscd.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/nfc-jukebox/app.py
+WorkingDirectory=/home/pi/nfc-jukebox
+Restart=always
+User=root
+Environment=PYTHONUNBUFFERED=1
+Environment=PCSCLITE_CSOCK_NAME=/run/pcscd/pcscd.comm
+
+[Install]
+WantedBy=multi-user.target
